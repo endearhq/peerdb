@@ -197,9 +197,9 @@ func (c *PubSubConnector) createPool(
 			if message.OrderingKey != "" {
 				topic.Publisher.EnableMessageOrdering = true
 			}
-			// Give up once the batch is cancelled. After a failed publish nothing
-			// reads this channel any more, and an unconditional send would block
-			// the pool and, through it, the SyncRecords loop for good.
+			// Give up once the batch is cancelled, so a failed batch tears down
+			// without depending on the consumer: a send that waited here would
+			// block the pool and, through it, the SyncRecords loop in pool.Run.
 			select {
 			case publish <- publishResult{
 				PublishResult: topic.Publisher.Publish(ctx, message.Message),
@@ -235,20 +235,19 @@ func (c *PubSubConnector) SyncRecords(ctx context.Context, req *model.SyncRecord
 
 	go func() {
 		defer close(waitChan)
-		// After the first failure keep draining, so no sender can ever block on
-		// this channel, but stop confirming: an LSN sentinel that follows a
-		// failed message must not advance lastSeenLSN, which the flush loop
-		// persists as the consumed offset.
-		failed := false
+		// Once the batch is cancelled, for a failed publish or for any error the
+		// pool reports, keep draining so no sender can ever block on this
+		// channel, but stop confirming: an LSN sentinel that follows a failed
+		// record must not advance lastSeenLSN, which the flush loop persists as
+		// the consumed offset.
 		for curpub := range publish {
-			if failed {
+			if queueCtx.Err() != nil {
 				continue
 			}
 			if curpub.PublishResult == nil {
 				shared.AtomicInt64Max(&lastSeenLSN, curpub.lsn)
 			} else if _, err := curpub.Get(queueCtx); err != nil {
 				queueErr(fmt.Errorf("[pubsub] error publishing message: %w", err))
-				failed = true
 			}
 		}
 	}()
