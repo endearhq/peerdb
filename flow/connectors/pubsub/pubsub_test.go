@@ -81,6 +81,7 @@ func TestSyncRecordsFailsInsteadOfHangingOnPublishError(t *testing.T) {
 
 	feedCtx, stopFeeding := context.WithCancel(ctx)
 	defer stopFeeding()
+	var fed atomic.Int64
 	go func() {
 		for i := int64(1); feedCtx.Err() == nil; i++ {
 			items := model.NewRecordItems(1)
@@ -97,12 +98,17 @@ func TestSyncRecordsFailsInsteadOfHangingOnPublishError(t *testing.T) {
 			if err := stream.AddRecord(feedCtx, record); err != nil {
 				return
 			}
+			fed.Store(i)
 		}
 	}()
 
-	// The stream only backs up once the main loop is blocked behind the full
-	// pipeline, which is the state the hang needs.
-	require.Eventually(t, func() bool { return stream.ChannelLen() == buffered }, 10*time.Second, 10*time.Millisecond)
+	// The stream backs up once the main loop is blocked behind the full pipeline,
+	// which is the state the hang needs. The loop has taken a handful of records
+	// only after the pool merged the first one, so by then the topic has been
+	// looked up and cached, and deleting it cannot race that lookup.
+	require.Eventually(t, func() bool {
+		return stream.ChannelLen() == buffered && fed.Load()-buffered >= 8
+	}, 10*time.Second, 10*time.Millisecond)
 	err = client.TopicAdminClient.DeleteTopic(ctx, &pubsubpb.DeleteTopicRequest{Topic: topicName})
 	require.NoError(t, err)
 
