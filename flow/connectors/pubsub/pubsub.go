@@ -197,12 +197,22 @@ func (c *PubSubConnector) createPool(
 			if message.OrderingKey != "" {
 				topic.Publisher.EnableMessageOrdering = true
 			}
-			publish <- publishResult{
+			// Give up once the batch is cancelled. After a failed publish nothing
+			// reads this channel any more, and an unconditional send would block
+			// the pool and, through it, the SyncRecords loop for good.
+			select {
+			case publish <- publishResult{
 				PublishResult: topic.Publisher.Publish(ctx, message.Message),
+			}:
+			case <-ctx.Done():
+				return
 			}
 		}
-		publish <- publishResult{
+		select {
+		case publish <- publishResult{
 			lsn: result.lsn,
+		}:
+		case <-ctx.Done():
 		}
 	})
 }
@@ -224,15 +234,23 @@ func (c *PubSubConnector) SyncRecords(ctx context.Context, req *model.SyncRecord
 	defer pool.Close()
 
 	go func() {
+		defer close(waitChan)
+		// After the first failure keep draining, so no sender can ever block on
+		// this channel, but stop confirming: an LSN sentinel that follows a
+		// failed message must not advance lastSeenLSN, which the flush loop
+		// persists as the consumed offset.
+		failed := false
 		for curpub := range publish {
+			if failed {
+				continue
+			}
 			if curpub.PublishResult == nil {
 				shared.AtomicInt64Max(&lastSeenLSN, curpub.lsn)
-			} else if _, err := curpub.Get(ctx); err != nil {
+			} else if _, err := curpub.Get(queueCtx); err != nil {
 				queueErr(fmt.Errorf("[pubsub] error publishing message: %w", err))
-				break
+				failed = true
 			}
 		}
-		close(waitChan)
 	}()
 
 	flushLoopDone := make(chan struct{})
@@ -321,17 +339,24 @@ Loop:
 	}
 
 	close(flushLoopDone)
-	if err := pool.Wait(queueCtx); err != nil {
+	// Wait for the pool even when the batch has failed: its sends give up on
+	// queueCtx, so it finishes promptly, and publish may only be closed once
+	// nothing will send on it again. Returning early here used to leak the
+	// consumer goroutine, the Lua states and the publishers of a failed batch.
+	if err := pool.Wait(context.WithoutCancel(queueCtx)); err != nil {
 		return nil, fmt.Errorf("[pubsub] pool.Wait error: %w", err)
 	}
 	close(publish)
-	topiccache.ForEach(queueCtx, func(_ *pubsubpb.Topic, publisher *pubsub.Publisher) {
-		publisher.Stop()
+	// Stop publishers concurrently: each Stop waits for its pending messages to
+	// be sent or to fail, which after an outage can take a publish timeout.
+	var stopping sync.WaitGroup
+	topiccache.ForEach(context.WithoutCancel(queueCtx), func(_ *pubsubpb.Topic, publisher *pubsub.Publisher) {
+		stopping.Go(publisher.Stop)
 	})
-	select {
-	case <-queueCtx.Done():
-		return nil, fmt.Errorf("[pubsub] queueCtx.Done: %w", context.Cause(queueCtx))
-	case <-waitChan:
+	stopping.Wait()
+	<-waitChan
+	if err := context.Cause(queueCtx); err != nil {
+		return nil, fmt.Errorf("[pubsub] sync failed: %w", err)
 	}
 
 	lastCheckpoint := req.Records.GetLastCheckpoint()
