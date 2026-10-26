@@ -2,7 +2,6 @@ package connpubsub
 
 import (
 	"context"
-	"os"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -10,7 +9,13 @@ import (
 
 	"cloud.google.com/go/pubsub/v2"
 	pubsubpb "cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
+	"cloud.google.com/go/pubsub/v2/pstest"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/api/option"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
 	"github.com/PeerDB-io/peerdb/flow/internal"
@@ -18,41 +23,55 @@ import (
 	"github.com/PeerDB-io/peerdb/flow/shared/types"
 )
 
+// failingPublish fails every Publish RPC with a code the client does not retry.
+// The first one is held for a while first, so the consumer waits on it while
+// the feeder fills the pipeline behind it.
+type failingPublish struct {
+	hold time.Duration
+	held atomic.Bool
+}
+
+func (r *failingPublish) React(_ any) (bool, any, error) {
+	if r.held.CompareAndSwap(false, true) {
+		time.Sleep(r.hold)
+	}
+	return true, &pubsubpb.PublishResponse{}, status.Error(codes.PermissionDenied, "injected publish failure")
+}
+
 // A failed publish RPC used to deadlock SyncRecords. Under load the pipeline is
 // full: the consumer waits on a batch, the pool is blocked sending its next
 // result, and the main loop is blocked in pool.Run. When the batch then fails,
-// the consumer stops reading after one result, which frees one slot: the pool
-// sends one more message result and blocks on that record's LSN sentinel for
-// good, and the main loop never gets back to the select that would see the
+// the consumer stopped reading after one result, which freed one slot: the pool
+// sent one more message result and blocked on that record's LSN sentinel for
+// good, and the main loop never got back to the select that would see the
 // cancelled batch. The activity kept heartbeating, so the mirror sat in
 // STATUS_RUNNING until someone paused it.
 //
-// Runs against the Pub/Sub emulator (PUBSUB_EMULATOR_HOST). The first batch is
-// held back long enough for the pipeline to fill, and the topic is deleted
-// underneath it, so the whole batch fails as a real outage would.
+// Runs against an in-process Pub/Sub fake whose first publish RPC is held back
+// long enough for the pipeline to fill and then fails, as a real outage would.
 func TestSyncRecordsFailsInsteadOfHangingOnPublishError(t *testing.T) {
-	if os.Getenv("PUBSUB_EMULATOR_HOST") == "" {
-		t.Skip("PUBSUB_EMULATOR_HOST not set")
-	}
 	ctx := t.Context()
 
-	// Publishers copy these defaults when SyncRecords creates them.
-	defaults := pubsub.DefaultPublishSettings
-	t.Cleanup(func() { pubsub.DefaultPublishSettings = defaults })
-	pubsub.DefaultPublishSettings.DelayThreshold = 2 * time.Second
-	pubsub.DefaultPublishSettings.CountThreshold = 1000
-
-	client, err := pubsub.NewClient(ctx, "peerdb-test")
+	srv := pstest.NewServer(pstest.ServerReactorOption{
+		FuncName: "Publish",
+		Reactor:  &failingPublish{hold: 2 * time.Second},
+	})
+	defer srv.Close()
+	conn, err := grpc.NewClient(srv.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer conn.Close()
+	client, err := pubsub.NewClient(ctx, "peerdb-test", option.WithGRPCConn(conn))
 	require.NoError(t, err)
 	defer client.Close()
 
 	topic := "deadlock_" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	topicName := "projects/peerdb-test/topics/" + topic
-	_, err = client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: topicName})
+	_, err = client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: "projects/peerdb-test/topics/" + topic})
 	require.NoError(t, err)
 
-	// No catalog behind this connector: every setting is pinned through Env, the
-	// flush loop never fires, and the failure path never reaches FinishBatch.
+	// No catalog behind this connector: every setting is pinned through Env and
+	// the flush loop never fires. The record stream is never closed, so the only
+	// way out of SyncRecords is the failure path, which never reaches the
+	// catalog-backed FinishBatch.
 	c := &PubSubConnector{client: client, logger: internal.LoggerFromCtx(ctx)}
 	const buffered = 1024
 	stream := model.NewCDCStream[model.RecordItems](buffered)
@@ -103,14 +122,11 @@ func TestSyncRecordsFailsInsteadOfHangingOnPublishError(t *testing.T) {
 	}()
 
 	// The stream backs up once the main loop is blocked behind the full pipeline,
-	// which is the state the hang needs. The loop has taken a handful of records
-	// only after the pool merged the first one, so by then the topic has been
-	// looked up and cached, and deleting it cannot race that lookup.
+	// which is the state the hang needs; with parallelism 1 the loop has taken a
+	// handful of records only after the pool merged the first one.
 	require.Eventually(t, func() bool {
 		return stream.ChannelLen() == buffered && fed.Load()-buffered >= 8
 	}, 10*time.Second, 10*time.Millisecond)
-	err = client.TopicAdminClient.DeleteTopic(ctx, &pubsubpb.DeleteTopicRequest{Topic: topicName})
-	require.NoError(t, err)
 
 	select {
 	case err := <-done:
